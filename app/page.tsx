@@ -2,6 +2,9 @@
 
 import { useState } from "react";
 import { createWorker } from "tesseract.js";
+import { Document, Packer, Paragraph, TextRun, HeadingLevel } from "docx";
+import { saveAs } from "file-saver";
+import jsPDF from "jspdf";
 
 interface ParsedQuestion {
   question: string;
@@ -31,21 +34,40 @@ export default function Home() {
     const questions: ParsedQuestion[] = [];
     let currentQuestion: ParsedQuestion | null = null;
 
+    const questionRegex = /^(\bQ?\d+[\.\)]|\bQuestion\s*\d*[:\.\)]?)\s+/i;
+    const optionTokenRegex = /(\([1-4A-Da-d]\)|\[[1-4A-Da-d]\]|\b[1-4A-Da-d][\.\)])\s+/g;
+
     lines.forEach((line) => {
-      // Matches question starters: 1., Q1., Question 1, etc.
-      if (/^(Q?\d+[\.\)]|\bQuestion\s*\d*[:\.\)]?)/i.test(line)) {
+      if (questionRegex.test(line)) {
         if (currentQuestion) questions.push(currentQuestion);
         currentQuestion = { question: line, options: [] };
+        return;
       }
-      // Matches options starters: (A), A., A), [A], 1., etc.
-      else if (/^(\([A-Da-d\d]\)|[A-Da-d][\.\)]|\[[A-Da-d]\])/.test(line)) {
-        if (currentQuestion) {
-          currentQuestion.options.push(line);
+
+      const matches = [...line.matchAll(optionTokenRegex)];
+
+      if (matches.length > 0) {
+        if (!currentQuestion) {
+          currentQuestion = { question: "Extracted Question", options: [] };
         }
-      } 
-      // If continuing question description before options start
-      else if (currentQuestion && currentQuestion.options.length === 0) {
-        currentQuestion.question += " " + line;
+
+        matches.forEach((match, idx) => {
+          const startIndex = match.index!;
+          const endIndex =
+            idx + 1 < matches.length ? matches[idx + 1].index! : line.length;
+          const optText = line.substring(startIndex, endIndex).trim();
+          if (optText) {
+            currentQuestion?.options.push(optText);
+          }
+        });
+      } else if (currentQuestion) {
+        if (line.length <= 2 && /^[PpvV\-_\|]+$/.test(line)) {
+          return;
+        }
+
+        if (currentQuestion.options.length === 0) {
+          currentQuestion.question += " " + line;
+        }
       }
     });
 
@@ -60,7 +82,6 @@ export default function Home() {
 
     try {
       const worker = await createWorker("eng");
-      
       setProgress("Reading image text...");
       const {
         data: { text },
@@ -71,11 +92,102 @@ export default function Home() {
       parseQuestionsAndOptions(text);
     } catch (err) {
       console.error("OCR Extraction failed:", err);
-      alert("Failed to read image. Please try again with a clearer image.");
+      alert("Failed to read image. Please try again.");
     } finally {
       setLoading(false);
       setProgress("");
     }
+  };
+
+  // Export to Microsoft Word (.docx)
+  const exportToWord = async () => {
+    if (parsedQuestions.length === 0) return;
+
+    const docChildren: Paragraph[] = [
+      new Paragraph({
+        text: "Extracted Quiz Questions",
+        heading: HeadingLevel.TITLE,
+        spacing: { after: 300 },
+      }),
+    ];
+
+    parsedQuestions.forEach((item, index) => {
+      docChildren.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `${index + 1}. ${item.question.replace(/^\d+[\.\)]\s*/, "")}`,
+              bold: true,
+            }),
+          ],
+          spacing: { before: 200, after: 100 },
+        })
+      );
+
+      item.options.forEach((opt) => {
+        docChildren.push(
+          new Paragraph({
+            text: opt,
+            indent: { left: 720 },
+            spacing: { after: 50 },
+          })
+        );
+      });
+    });
+
+    const doc = new Document({
+      sections: [{ children: docChildren }],
+    });
+
+    const blob = await Packer.toBlob(doc);
+    saveAs(blob, "quiz-questions.docx");
+  };
+
+  // Export to PDF (.pdf)
+  const exportToPDF = () => {
+    if (parsedQuestions.length === 0) return;
+
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 15;
+    const maxLineWidth = pageWidth - margin * 2;
+    let y = 20;
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.text("Extracted Quiz Questions", margin, y);
+    y += 10;
+
+    parsedQuestions.forEach((item, index) => {
+      if (y > pageHeight - 30) {
+        doc.addPage();
+        y = 20;
+      }
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      const cleanQ = `${index + 1}. ${item.question.replace(/^\d+[\.\)]\s*/, "")}`;
+      const splitTitle = doc.splitTextToSize(cleanQ, maxLineWidth);
+      doc.text(splitTitle, margin, y);
+      y += splitTitle.length * 6;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      item.options.forEach((opt) => {
+        if (y > pageHeight - 20) {
+          doc.addPage();
+          y = 20;
+        }
+        const splitOpt = doc.splitTextToSize(opt, maxLineWidth - 10);
+        doc.text(splitOpt, margin + 5, y);
+        y += splitOpt.length * 5;
+      });
+
+      y += 4;
+    });
+
+    doc.save("quiz-questions.pdf");
   };
 
   return (
@@ -86,7 +198,7 @@ export default function Home() {
             Paper Question Extractor
           </h1>
           <p className="text-zinc-600">
-            Upload an image of a question paper to convert it into text and options.
+            Upload question paper photos to extract questions and export them directly to Word or PDF.
           </p>
         </header>
 
@@ -118,12 +230,29 @@ export default function Home() {
           </div>
         )}
 
-        {/* Display Parsed Questions */}
+        {/* Display Parsed Questions & Export Actions */}
         {parsedQuestions.length > 0 && (
           <section className="space-y-4">
-            <h2 className="text-xl font-semibold text-zinc-800">
-              Extracted Results ({parsedQuestions.length})
-            </h2>
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <h2 className="text-xl font-semibold text-zinc-800">
+                Extracted Results ({parsedQuestions.length})
+              </h2>
+              <div className="flex gap-2">
+                <button
+                  onClick={exportToWord}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium transition"
+                >
+                  Download Word (.docx)
+                </button>
+                <button
+                  onClick={exportToPDF}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium transition"
+                >
+                  Download PDF (.pdf)
+                </button>
+              </div>
+            </div>
+
             <div className="space-y-4">
               {parsedQuestions.map((item, index) => (
                 <div
